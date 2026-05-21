@@ -35,7 +35,6 @@ use crate::{
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
-use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use file_icons::FileIcons;
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatus};
 use gpui::{
@@ -1340,7 +1339,6 @@ impl EditorElement {
 
         // Handle diff review indicator when gutter is hovered in diff mode with AI enabled
         let show_diff_review = editor.show_diff_review_button()
-            && cx.has_flag::<DiffReviewFeatureFlag>()
             && !DisableAiSettings::is_ai_disabled_for_buffer(
                 editor.buffer.read(cx).as_singleton().as_ref(),
                 cx,
@@ -3321,10 +3319,6 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         cx: &App,
     ) -> Option<(DisplayRow, Option<u32>)> {
-        if !cx.has_flag::<DiffReviewFeatureFlag>() {
-            return None;
-        }
-
         let show_diff_review_button = self.editor.read(cx).show_diff_review_button();
         if !show_diff_review_button {
             return None;

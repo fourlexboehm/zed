@@ -494,6 +494,79 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn add_diff_review_comment_for_path_line(
+        &mut self,
+        file_path: &str,
+        line: u32,
+        comment: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some((hunk_key, anchor_range)) =
+            Self::diff_review_location_for_path_line(&buffer_snapshot, file_path, line)
+        else {
+            return false;
+        };
+
+        if !self
+            .diff_review_overlays
+            .iter()
+            .any(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &buffer_snapshot))
+        {
+            let editor_snapshot = self.snapshot(window, cx);
+            let display_row = hunk_key
+                .hunk_start_anchor
+                .to_display_point(&editor_snapshot.display_snapshot)
+                .row();
+            self.show_diff_review_overlay(display_row..display_row, window, cx);
+        }
+
+        self.add_review_comment(hunk_key.clone(), comment, anchor_range, cx);
+        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        true
+    }
+
+    fn diff_review_location_for_path_line(
+        snapshot: &MultiBufferSnapshot,
+        file_path: &str,
+        line: u32,
+    ) -> Option<(DiffHunkKey, Range<Anchor>)> {
+        let buffer_row = line.saturating_sub(1);
+        for excerpt in snapshot.excerpts() {
+            let buffer_id = excerpt.context.start.buffer_id;
+            let path = snapshot.path_for_buffer(buffer_id)?;
+            if path.path.as_unix_str() != file_path {
+                continue;
+            }
+
+            let buffer_snapshot = snapshot.buffer_for_id(buffer_id)?;
+            let max_row = buffer_snapshot.max_point().row;
+            let row = buffer_row.min(max_row);
+            let line_start = Point::new(row, 0);
+            let line_end = Point::new(row, buffer_snapshot.line_len(row));
+            let line_start_anchor = buffer_snapshot.anchor_before(line_start);
+            let line_end_anchor = buffer_snapshot.anchor_after(line_end);
+
+            if !excerpt.contains(&line_start_anchor, buffer_snapshot) {
+                continue;
+            }
+
+            let hunk_start_anchor = snapshot.anchor_in_buffer(line_start_anchor)?;
+            let range = snapshot.anchor_in_buffer(line_start_anchor)?
+                ..snapshot.anchor_in_buffer(line_end_anchor)?;
+            return Some((
+                DiffHunkKey {
+                    file_path: path.path.clone(),
+                    hunk_start_anchor,
+                },
+                range,
+            ));
+        }
+
+        None
+    }
+
     /// Stores the diff review comment locally.
     /// Comments are stored per-hunk and can later be batch-submitted to the Agent panel.
     pub fn submit_diff_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {

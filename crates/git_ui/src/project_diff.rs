@@ -18,14 +18,15 @@ use futures_lite::future::yield_now;
 use git::repository::DiffType;
 
 use git::{
-    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
-    status::FileStatus,
+    Commit, RemoteUrl, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext,
+    repository::RepoPath, status::FileStatus,
 };
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter,
-    FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions, rems,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
+use menu::{Cancel, Confirm};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
@@ -34,20 +35,23 @@ use project::{
         branch_diff::{self, BranchDiffEvent, DiffBase},
     },
 };
+use serde::Deserialize;
 use settings::{Settings, SettingsStore};
 use std::any::{Any, TypeId};
+use std::path::PathBuf;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
     CommonAnimationExt as _, DiffStat, Divider, KeyBinding, PopoverMenu, Tooltip, prelude::*,
     vertical_divider,
 };
+use util::command;
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
-    ToolbarItemView, Workspace,
+    CloseActiveItem, ItemNavHistory, ModalView, SerializableItem, Toast, ToolbarItemEvent,
+    ToolbarItemLocation, ToolbarItemView, Workspace,
     item::{Item, ItemEvent, ItemHandle, SaveOptions, TabContentParams},
-    notifications::NotifyTaskExt,
+    notifications::{NotificationId, NotifyTaskExt},
     searchable::SearchableItemHandle,
 };
 use zed_actions::agent::ReviewBranchDiff;
@@ -63,6 +67,10 @@ actions!(
         /// Shows the diff between the working directory and your default
         /// branch (typically main or master).
         BranchDiff,
+        /// Opens PR Review Mode for the current branch.
+        OpenPrReviewMode,
+        /// Posts a comment to the current branch's pull request.
+        CommentOnPr,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
         LeaderAndFollower,
@@ -79,6 +87,8 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    pr_context: Option<PrContext>,
+    pr_context_load_started: bool,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -98,6 +108,9 @@ impl ProjectDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(Self::deploy);
         workspace.register_action(Self::deploy_branch_diff);
+        workspace.register_action(|workspace, _: &OpenPrReviewMode, window, cx| {
+            Self::deploy_branch_diff(workspace, &BranchDiff, window, cx);
+        });
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
         });
@@ -129,6 +142,7 @@ impl ProjectDiff {
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
 
+            let mut switched_repo = false;
             if let Some(intended_repo) = intended_repo {
                 let needs_switch = existing
                     .read(cx)
@@ -140,6 +154,7 @@ impl ProjectDiff {
                     });
 
                 if needs_switch {
+                    switched_repo = true;
                     let default_branch =
                         intended_repo.update(cx, |repo, _| repo.default_branch(true));
                     let existing = existing.downgrade();
@@ -151,6 +166,8 @@ impl ProjectDiff {
                                 .context("Could not determine default branch")?;
 
                             existing.update(cx, |project_diff, cx| {
+                                project_diff.pr_context = None;
+                                project_diff.pr_context_load_started = false;
                                 project_diff.branch_diff.update(cx, |branch_diff, cx| {
                                     branch_diff.set_repo(Some(intended_repo), cx);
                                     branch_diff.set_diff_base(
@@ -165,6 +182,15 @@ impl ProjectDiff {
                         })
                         .detach_and_notify_err(workspace, window, cx);
                 }
+            }
+
+            if !switched_repo {
+                existing.update(cx, |project_diff, cx| {
+                    if !project_diff.pr_context_load_started {
+                        project_diff.pr_context_load_started = true;
+                        project_diff.load_pr_context(window, cx);
+                    }
+                });
             }
 
             return;
@@ -232,6 +258,103 @@ impl ProjectDiff {
                 }
             })
             .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn load_pr_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pr_target) = self.pr_target(cx) else {
+            return;
+        };
+
+        let this = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let (pr_context, comments) = cx
+                    .background_spawn(async move {
+                        let pr_context = fetch_pr_context(pr_target.clone()).await?;
+                        let comments = match fetch_inline_pr_comments(pr_target).await {
+                            Ok(comments) => comments,
+                            Err(error) => {
+                                log::info!("failed to load inline PR comments: {error:#}");
+                                Vec::new()
+                            }
+                        };
+                        anyhow::Ok((pr_context, comments))
+                    })
+                    .await?;
+
+                let (loaded_count, pr_number) = this.update_in(cx, |this, window, cx| {
+                    let mut loaded_count = 0;
+                    let pr_number = pr_context.number;
+                    this.pr_context = Some(pr_context);
+                    this.editor.update(cx, |editor, cx| {
+                        editor.rhs_editor().update(cx, |editor, cx| {
+                            for comment in comments {
+                                let Some(line) = comment.line() else {
+                                    continue;
+                                };
+                                if editor.add_diff_review_comment_for_path_line(
+                                    &comment.path,
+                                    line,
+                                    comment.display_text(),
+                                    window,
+                                    cx,
+                                ) {
+                                    loaded_count += 1;
+                                }
+                            }
+                        });
+                    });
+                    cx.notify();
+                    (loaded_count, pr_number)
+                })?;
+
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        struct LoadPrCommentsToast;
+
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<LoadPrCommentsToast>(),
+                                format!("Loaded PR #{pr_number} body and {loaded_count} comments"),
+                            ),
+                            cx,
+                        );
+                    });
+                }
+
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(self.workspace.clone(), window, cx);
+    }
+
+    fn comment_on_pr(&mut self, _: &CommentOnPr, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pr_target) = self.pr_target(cx) else {
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    struct CommentOnPrToast;
+
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<CommentOnPrToast>(),
+                            "No local repository found for this review",
+                        ),
+                        cx,
+                    );
+                });
+            }
+            return;
+        };
+
+        let workspace = self.workspace.clone();
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                let workspace_handle = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    PrCommentModal::new(pr_target, workspace_handle, window, cx)
+                });
+            });
+        }
     }
 
     pub fn deploy_at(
@@ -491,6 +614,8 @@ impl ProjectDiff {
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            pr_context: None,
+            pr_context_load_started: false,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -590,6 +715,19 @@ impl ProjectDiff {
 
     pub fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
+    }
+
+    fn pr_target(&self, cx: &App) -> Option<PrTarget> {
+        let repo = self.branch_diff.read(cx).repo()?.read(cx);
+        let snapshot = repo.snapshot();
+        Some(PrTarget {
+            work_directory: snapshot.work_directory_abs_path.as_ref().to_path_buf(),
+            remote_url: repo.default_remote_url(),
+            branch_name: snapshot
+                .branch
+                .as_ref()
+                .map(|branch| branch.name().to_string()),
+        })
     }
 
     /// Returns the total count of review comments across all hunks/files.
@@ -920,6 +1058,17 @@ impl ProjectDiff {
             cx.notify();
         })?;
 
+        cx.update(|window, cx| {
+            this.update(cx, |this, cx| {
+                if matches!(this.diff_base(cx), DiffBase::Merge { .. })
+                    && !this.pr_context_load_started
+                {
+                    this.pr_context_load_started = true;
+                    this.load_pr_context(window, cx);
+                }
+            })
+        })??;
+
         Ok(())
     }
 
@@ -944,6 +1093,628 @@ impl ProjectDiff {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrContext {
+    number: u64,
+    title: String,
+    url: String,
+    body: String,
+    head_ref_name: String,
+    base_ref_name: String,
+}
+
+fn render_pr_body(pr_context: &PrContext, cx: &mut Context<ProjectDiff>) -> impl IntoElement {
+    let body = if pr_context.body.trim().is_empty() {
+        "_No PR body._"
+    } else {
+        pr_context.body.trim()
+    };
+
+    v_flex()
+        .w_full()
+        .max_h(rems(12.))
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(cx.theme().colors().border)
+        .bg(cx.theme().colors().editor_background)
+        .px_3()
+        .py_2()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Label::new(format!("#{} {}", pr_context.number, pr_context.title))
+                        .size(LabelSize::Small)
+                        .color(Color::Default),
+                )
+                .child(
+                    Label::new(format!(
+                        "{} <- {}  {}",
+                        pr_context.base_ref_name, pr_context.head_ref_name, pr_context.url
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                ),
+        )
+        .child(
+            div()
+                .max_h(rems(8.))
+                .overflow_hidden()
+                .child(Label::new(body).size(LabelSize::Small).color(Color::Muted)),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+struct InlinePrComment {
+    path: String,
+    line: Option<u32>,
+    original_line: Option<u32>,
+    position: Option<u32>,
+    original_position: Option<u32>,
+    diff_hunk: Option<String>,
+    body: String,
+    #[serde(default, alias = "html_url", alias = "url")]
+    html_url: String,
+    user: Option<PrAuthor>,
+}
+
+impl InlinePrComment {
+    fn line(&self) -> Option<u32> {
+        self.line.or(self.original_line).or_else(|| {
+            self.diff_hunk.as_deref().and_then(|diff_hunk| {
+                line_from_diff_position(
+                    diff_hunk,
+                    self.position.or(self.original_position).unwrap_or_default(),
+                )
+            })
+        })
+    }
+
+    fn display_text(&self) -> String {
+        let author = self
+            .user
+            .as_ref()
+            .map_or("unknown", |author| author.login.as_str());
+        if self.html_url.is_empty() {
+            format!("@{author}: {}", self.body.trim())
+        } else {
+            format!("@{author}: {}\n\n{}", self.body.trim(), self.html_url)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PrAuthor {
+    login: String,
+}
+
+#[derive(Clone)]
+struct PrTarget {
+    work_directory: PathBuf,
+    remote_url: Option<String>,
+    branch_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct ForgejoRemote {
+    host: String,
+    owner: String,
+    repo: String,
+}
+
+enum PrBackend {
+    Github,
+    Forgejo(ForgejoRemote),
+}
+
+impl PrBackend {
+    fn detect(target: &PrTarget) -> Result<Self> {
+        let Some(remote_url) = target.remote_url.as_deref() else {
+            return Ok(Self::Github);
+        };
+        let remote_url = remote_url
+            .parse::<RemoteUrl>()
+            .context("parsing git remote URL")?;
+        let host = remote_url.host_str().unwrap_or_default();
+        if host == "github.com" {
+            return Ok(Self::Github);
+        }
+
+        if host == "codeberg.org" || host.contains("forgejo") {
+            let mut path_segments = remote_url
+                .path_segments()
+                .context("reading git remote path segments")?;
+            let owner = path_segments
+                .next()
+                .context("missing owner in git remote URL")?
+                .to_string();
+            let repo = path_segments
+                .next()
+                .context("missing repo in git remote URL")?
+                .trim_end_matches(".git")
+                .to_string();
+            return Ok(Self::Forgejo(ForgejoRemote {
+                host: host.to_string(),
+                owner,
+                repo,
+            }));
+        }
+
+        Ok(Self::Github)
+    }
+}
+
+struct PrCommentModal {
+    editor: Entity<Editor>,
+    pr_target: PrTarget,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl PrCommentModal {
+    fn new(
+        pr_target: PrTarget,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Comment on this PR...", window, cx);
+            editor
+        });
+
+        Self {
+            editor,
+            pr_target,
+            workspace,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let body = self.editor.read(cx).text(cx).trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+
+        let pr_target = self.pr_target.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            cx.background_spawn(async move { post_pr_comment(pr_target, body).await })
+                .await?;
+
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    struct PostedPrCommentToast;
+
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<PostedPrCommentToast>(),
+                            "PR comment posted",
+                        ),
+                        cx,
+                    );
+                });
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
+
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for PrCommentModal {}
+impl ModalView for PrCommentModal {}
+
+impl Focusable for PrCommentModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for PrCommentModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("PrCommentModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::PullRequest).size(IconSize::XSmall))
+                    .child(Headline::new("Comment on PR").size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+async fn fetch_pr_context(target: PrTarget) -> Result<PrContext> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => fetch_github_pr_context(target.work_directory).await,
+        PrBackend::Forgejo(remote) => fetch_forgejo_pr_context(target, remote).await,
+    }
+}
+
+async fn fetch_github_pr_context(work_directory: PathBuf) -> Result<PrContext> {
+    let output = command::new_command("gh")
+        .args([
+            "pr",
+            "view",
+            "--json",
+            "number,title,body,headRefName,baseRefName,url",
+        ])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh pr view")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr view failed: {stderr}");
+    }
+
+    serde_json::from_slice(&output.stdout).context("parsing gh pr view output")
+}
+
+async fn fetch_inline_pr_comments(target: PrTarget) -> Result<Vec<InlinePrComment>> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => fetch_github_inline_pr_comments(target.work_directory).await,
+        PrBackend::Forgejo(remote) => fetch_forgejo_inline_pr_comments(target, remote).await,
+    }
+}
+
+async fn fetch_github_inline_pr_comments(work_directory: PathBuf) -> Result<Vec<InlinePrComment>> {
+    let pr_number_output = command::new_command("gh")
+        .args(["pr", "view", "--json", "number", "--jq", ".number"])
+        .current_dir(&work_directory)
+        .output()
+        .await
+        .context("running gh pr view")?;
+
+    if !pr_number_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pr_number_output.stderr);
+        anyhow::bail!("gh pr view failed: {stderr}");
+    }
+
+    let pr_number = String::from_utf8(pr_number_output.stdout)
+        .context("reading gh pr view output")?
+        .trim()
+        .to_string();
+    if pr_number.is_empty() {
+        anyhow::bail!("gh pr view did not return a PR number");
+    }
+
+    let endpoint = format!("repos/:owner/:repo/pulls/{pr_number}/comments");
+    let output = command::new_command("gh")
+        .args(["api", &endpoint])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh api for PR review comments")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api failed: {stderr}");
+    }
+
+    let comments: Vec<InlinePrComment> =
+        serde_json::from_slice(&output.stdout).context("parsing gh api review comments output")?;
+    Ok(comments
+        .into_iter()
+        .filter(|comment| comment.line().is_some())
+        .collect())
+}
+
+async fn post_pr_comment(target: PrTarget, body: String) -> Result<()> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => post_github_pr_comment(target.work_directory, body).await,
+        PrBackend::Forgejo(remote) => post_forgejo_pr_comment(target, remote, body).await,
+    }
+}
+
+async fn post_github_pr_comment(work_directory: PathBuf, body: String) -> Result<()> {
+    let output = command::new_command("gh")
+        .args(["pr", "comment", "--body", &body])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh pr comment")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr comment failed: {stderr}");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoPullRequest {
+    number: Option<u64>,
+    title: Option<String>,
+    body: Option<String>,
+    html_url: Option<String>,
+    url: Option<String>,
+    base: Option<ForgejoPrBranch>,
+    head: Option<ForgejoPrBranch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoPrBranch {
+    #[serde(rename = "ref")]
+    ref_name: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoPullReview {
+    id: Option<u64>,
+}
+
+async fn fetch_forgejo_pr_context(target: PrTarget, remote: ForgejoRemote) -> Result<PrContext> {
+    let pr = fetch_forgejo_current_pr(&target, &remote).await?;
+    let number = pr.number.context("Forgejo PR is missing a number")?;
+
+    Ok(PrContext {
+        number,
+        title: pr.title.unwrap_or_else(|| "Untitled PR".to_string()),
+        url: pr.html_url.or(pr.url).unwrap_or_else(|| {
+            format!(
+                "https://{}/{}/{}/pulls/{}",
+                remote.host, remote.owner, remote.repo, number
+            )
+        }),
+        body: pr.body.unwrap_or_default(),
+        head_ref_name: pr
+            .head
+            .as_ref()
+            .and_then(|head| head.label.as_ref().or(head.ref_name.as_ref()))
+            .cloned()
+            .unwrap_or_default(),
+        base_ref_name: pr
+            .base
+            .as_ref()
+            .and_then(|base| base.label.as_ref().or(base.ref_name.as_ref()))
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+async fn fetch_forgejo_inline_pr_comments(
+    target: PrTarget,
+    remote: ForgejoRemote,
+) -> Result<Vec<InlinePrComment>> {
+    let pr = fetch_forgejo_current_pr(&target, &remote).await?;
+    let number = pr.number.context("Forgejo PR is missing a number")?;
+    let reviews = fetch_forgejo_reviews_raw(&remote, number).await?;
+    let mut comments = Vec::new();
+
+    for review in reviews {
+        let Some(review_id) = review.id else {
+            continue;
+        };
+        let path = format!(
+            "/repos/{}/{}/pulls/{}/reviews/{}/comments",
+            remote.owner, remote.repo, number, review_id
+        );
+        let output = forgejo_api_get(&remote, &path).await?;
+        let mut review_comments = serde_json::from_slice::<Vec<InlinePrComment>>(&output)
+            .context("parsing Forgejo review comments")?;
+        comments.append(&mut review_comments);
+    }
+
+    Ok(comments
+        .into_iter()
+        .filter(|comment| comment.line().is_some())
+        .collect())
+}
+
+async fn post_forgejo_pr_comment(
+    target: PrTarget,
+    remote: ForgejoRemote,
+    body: String,
+) -> Result<()> {
+    let fj_output = command::new_command("fj")
+        .args(["pr", "comment", &body])
+        .current_dir(&target.work_directory)
+        .output()
+        .await;
+
+    match fj_output {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::info!("fj pr comment failed, falling back to Forgejo API: {stderr}");
+        }
+        Err(error) => {
+            log::info!("failed to run fj pr comment, falling back to Forgejo API: {error:#}");
+        }
+    }
+
+    let pr = fetch_forgejo_current_pr(&target, &remote).await?;
+    let number = pr.number.context("Forgejo PR is missing a number")?;
+    let path = format!(
+        "/repos/{}/{}/issues/{}/comments",
+        remote.owner, remote.repo, number
+    );
+    forgejo_api_post_json(&remote, &path, serde_json::json!({ "body": body })).await?;
+    Ok(())
+}
+
+async fn fetch_forgejo_current_pr(
+    target: &PrTarget,
+    remote: &ForgejoRemote,
+) -> Result<ForgejoPullRequest> {
+    if let Ok(pr_number) = std::env::var("ZED_FORGEJO_PR") {
+        let pr_number = pr_number.trim();
+        if !pr_number.is_empty() {
+            let path = format!(
+                "/repos/{}/{}/pulls/{}",
+                remote.owner, remote.repo, pr_number
+            );
+            let output = forgejo_api_get(remote, &path).await?;
+            return serde_json::from_slice(&output).context("parsing Forgejo PR");
+        }
+    }
+
+    let path = format!(
+        "/repos/{}/{}/pulls?state=open&limit=50",
+        remote.owner, remote.repo
+    );
+    let output = forgejo_api_get(remote, &path).await?;
+    let prs: Vec<ForgejoPullRequest> =
+        serde_json::from_slice(&output).context("parsing Forgejo pull requests")?;
+
+    let Some(branch_name) = target.branch_name.as_deref() else {
+        return single_forgejo_pr(prs);
+    };
+
+    let matching_prs = prs
+        .into_iter()
+        .filter(|pr| {
+            pr.head.as_ref().is_some_and(|head| {
+                head.ref_name.as_deref() == Some(branch_name)
+                    || head.label.as_deref() == Some(branch_name)
+                    || head
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.ends_with(&format!(":{branch_name}")))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    single_forgejo_pr(matching_prs)
+        .with_context(|| format!("finding open Forgejo PR for current branch `{branch_name}`"))
+}
+
+fn single_forgejo_pr(mut prs: Vec<ForgejoPullRequest>) -> Result<ForgejoPullRequest> {
+    match prs.len() {
+        0 => anyhow::bail!("no matching open Forgejo PR found"),
+        1 => Ok(prs.remove(0)),
+        count => anyhow::bail!("found {count} matching Forgejo PRs; set ZED_FORGEJO_PR"),
+    }
+}
+
+async fn fetch_forgejo_reviews_raw(
+    remote: &ForgejoRemote,
+    pr_number: u64,
+) -> Result<Vec<ForgejoPullReview>> {
+    let path = format!(
+        "/repos/{}/{}/pulls/{}/reviews",
+        remote.owner, remote.repo, pr_number
+    );
+    let output = forgejo_api_get(remote, &path).await?;
+    serde_json::from_slice(&output).context("parsing Forgejo reviews")
+}
+
+async fn forgejo_api_get(remote: &ForgejoRemote, path: &str) -> Result<Vec<u8>> {
+    forgejo_api_request(remote, "GET", path, None).await
+}
+
+async fn forgejo_api_post_json(
+    remote: &ForgejoRemote,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<Vec<u8>> {
+    forgejo_api_request(remote, "POST", path, Some(body.to_string())).await
+}
+
+async fn forgejo_api_request(
+    remote: &ForgejoRemote,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<Vec<u8>> {
+    let url = format!("https://{}/api/v1{path}", remote.host);
+    let mut command = command::new_command("curl");
+    command.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--request",
+        method,
+        "--header",
+        "Accept: application/json",
+    ]);
+    if let Ok(token) = std::env::var("CODEBERG_TOKEN")
+        && !token.trim().is_empty()
+    {
+        command.args([
+            "--header",
+            &format!("Authorization: Bearer {}", token.trim()),
+        ]);
+    }
+    if let Some(body) = body {
+        command.args([
+            "--header",
+            "Content-Type: application/json",
+            "--data",
+            &body,
+        ]);
+    }
+    command.arg(url);
+
+    let output = command
+        .output()
+        .await
+        .context("running curl for Forgejo API")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Forgejo API request failed: {stderr}");
+    }
+    Ok(output.stdout)
+}
+
+fn line_from_diff_position(diff_hunk: &str, position: u32) -> Option<u32> {
+    if position == 0 {
+        return None;
+    }
+
+    let mut new_line = None;
+    let mut diff_position = 0;
+    for line in diff_hunk.lines() {
+        if let Some(start) = parse_new_line_start(line) {
+            new_line = Some(start);
+            diff_position = 0;
+            continue;
+        }
+
+        let current_new_line = new_line?;
+        diff_position += 1;
+        if diff_position == position {
+            return Some(current_new_line);
+        }
+
+        if !line.starts_with('-') {
+            new_line = current_new_line.checked_add(1);
+        }
+    }
+
+    None
+}
+
+fn parse_new_line_start(line: &str) -> Option<u32> {
+    let plus_index = line.find('+')?;
+    let new_range = line.get(plus_index + 1..)?;
+    let end = new_range
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(new_range.len());
+    new_range.get(..end)?.parse().ok()
 }
 
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
@@ -1172,6 +1943,7 @@ impl Render for ProjectDiff {
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
             .when(is_branch_diff_view, |this| {
                 this.on_action(cx.listener(Self::review_diff))
+                    .on_action(cx.listener(Self::comment_on_pr))
             })
             .bg(cx.theme().colors().editor_background)
             .flex()
@@ -1235,7 +2007,17 @@ impl Render for ProjectDiff {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                el.child(
+                    v_flex()
+                        .size_full()
+                        .overflow_hidden()
+                        .when_some(self.pr_context.as_ref(), |this, pr_context| {
+                            this.child(render_pr_body(pr_context, cx))
+                        })
+                        .child(self.editor.clone()),
+                )
+            })
     }
 }
 
@@ -1774,6 +2556,30 @@ impl Render for BranchDiffToolbar {
                     additions as usize,
                     deletions as usize,
                 ))
+            })
+            .when(!is_multibuffer_empty, |this| {
+                let focus_handle = focus_handle.clone();
+                this.child(Divider::vertical()).child(
+                    Button::new("comment-on-pr", "Comment on PR")
+                        .start_icon(
+                            Icon::new(IconName::PullRequest)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .key_binding(KeyBinding::for_action_in(&CommentOnPr, &focus_handle, cx))
+                        .tooltip(move |_, cx| {
+                            Tooltip::with_meta_in(
+                                "Comment on PR",
+                                Some(&CommentOnPr),
+                                "Post a general comment to this branch's pull request.",
+                                &focus_handle,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&CommentOnPr, window, cx);
+                        })),
+                )
             })
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();
