@@ -4,10 +4,9 @@ use crate::{
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
-use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
@@ -18,14 +17,15 @@ use futures_lite::future::yield_now;
 use git::repository::DiffType;
 
 use git::{
-    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
-    status::FileStatus,
+    Commit, RemoteUrl, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext,
+    repository::RepoPath, status::FileStatus,
 };
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter,
-    FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions, rems,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
+use menu::{Cancel, Confirm};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
@@ -34,20 +34,23 @@ use project::{
         branch_diff::{self, BranchDiffEvent, DiffBase},
     },
 };
+use serde::Deserialize;
 use settings::{Settings, SettingsStore};
 use std::any::{Any, TypeId};
+use std::path::PathBuf;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
-    CommonAnimationExt as _, DiffStat, Divider, KeyBinding, PopoverMenu, Tooltip, prelude::*,
-    vertical_divider,
+    Checkbox, CommonAnimationExt as _, DiffStat, Divider, ElevationIndex, KeyBinding, PopoverMenu,
+    Tooltip, prelude::*, vertical_divider,
 };
+use util::command;
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
-    ToolbarItemView, Workspace,
+    CloseActiveItem, ItemNavHistory, ModalView, SerializableItem, Toast, ToolbarItemEvent,
+    ToolbarItemLocation, ToolbarItemView, Workspace,
     item::{Item, ItemEvent, ItemHandle, SaveOptions, TabContentParams},
-    notifications::NotifyTaskExt,
+    notifications::{NotificationId, NotifyTaskExt},
     searchable::SearchableItemHandle,
 };
 use zed_actions::agent::ReviewBranchDiff;
@@ -63,6 +66,14 @@ actions!(
         /// Shows the diff between the working directory and your default
         /// branch (typically main or master).
         BranchDiff,
+        /// Opens PR Review Mode for the current branch.
+        OpenPrReviewMode,
+        /// Posts a comment to the current branch's pull request.
+        CommentOnPr,
+        /// Toggles whether inline review comments are saved as drafts or posted immediately.
+        TogglePrReviewSubmitMode,
+        /// Toggles whether the current file has been reviewed.
+        ToggleCurrentFileReviewed,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
         LeaderAndFollower,
@@ -79,8 +90,29 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    pr_context: Option<PrContext>,
+    pr_context_load_started: bool,
+    review_submit_mode: PrReviewSubmitMode,
+    reviewed_files: HashSet<String>,
+    draft_comments: Vec<ReviewDraftComment>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewDraftComment {
+    pub id: u64,
+    pub path: String,
+    pub line: u32,
+    pub position: u32,
+    pub body: String,
+    pub status: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrReviewSubmitMode {
+    AddToReview,
+    PostNow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +130,9 @@ impl ProjectDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(Self::deploy);
         workspace.register_action(Self::deploy_branch_diff);
+        workspace.register_action(|workspace, _: &OpenPrReviewMode, window, cx| {
+            Self::deploy_branch_diff(workspace, &BranchDiff, window, cx);
+        });
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
         });
@@ -129,6 +164,7 @@ impl ProjectDiff {
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
 
+            let mut switched_repo = false;
             if let Some(intended_repo) = intended_repo {
                 let needs_switch = existing
                     .read(cx)
@@ -140,6 +176,7 @@ impl ProjectDiff {
                     });
 
                 if needs_switch {
+                    switched_repo = true;
                     let default_branch =
                         intended_repo.update(cx, |repo, _| repo.default_branch(true));
                     let existing = existing.downgrade();
@@ -151,6 +188,8 @@ impl ProjectDiff {
                                 .context("Could not determine default branch")?;
 
                             existing.update(cx, |project_diff, cx| {
+                                project_diff.pr_context = None;
+                                project_diff.pr_context_load_started = false;
                                 project_diff.branch_diff.update(cx, |branch_diff, cx| {
                                     branch_diff.set_repo(Some(intended_repo), cx);
                                     branch_diff.set_diff_base(
@@ -165,6 +204,15 @@ impl ProjectDiff {
                         })
                         .detach_and_notify_err(workspace, window, cx);
                 }
+            }
+
+            if !switched_repo {
+                existing.update(cx, |project_diff, cx| {
+                    if !project_diff.pr_context_load_started {
+                        project_diff.pr_context_load_started = true;
+                        project_diff.load_pr_context(window, cx);
+                    }
+                });
             }
 
             return;
@@ -232,6 +280,137 @@ impl ProjectDiff {
                 }
             })
             .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn load_pr_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pr_target) = self.pr_target(cx) else {
+            return;
+        };
+        let remote_url = pr_target.remote_url.clone().unwrap_or_default();
+
+        let this = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let db = persistence::ProjectDiffDb::global(cx);
+        let workspace_id = workspace.read_with(cx, |w, _| w.database_id()).ok().flatten();
+
+        window
+            .spawn(cx, async move |cx| {
+                let (pr_context, comments) = cx
+                    .background_spawn(async move {
+                        let pr_context = fetch_pr_context(pr_target.clone()).await?;
+                        let comments = match fetch_inline_pr_comments(pr_target).await {
+                            Ok(comments) => comments,
+                            Err(error) => {
+                                log::info!("failed to load inline PR comments: {error:#}");
+                                Vec::new()
+                            }
+                        };
+                        anyhow::Ok((pr_context, comments))
+                    })
+                    .await?;
+
+                let pr_number = pr_context.number;
+                let (reviewed_files, draft_comments) = if let Some(workspace_id) = workspace_id {
+                    let db = db.clone();
+                    let remote_url = remote_url.clone();
+                    cx.background_spawn(async move {
+                        let reviewed_files = db
+                            .get_reviewed_files(workspace_id, remote_url.clone(), pr_number)
+                            .unwrap_or_default();
+                        let draft_comments = db
+                            .get_draft_comments(workspace_id, remote_url, pr_number)
+                            .unwrap_or_default();
+                        (reviewed_files, draft_comments)
+                    })
+                    .await
+                } else {
+                    (Default::default(), Default::default())
+                };
+
+                let loaded_count = this.update_in(cx, |this, window, cx| {
+                    let mut loaded_count = 0;
+                    this.pr_context = Some(pr_context);
+                    this.reviewed_files = reviewed_files;
+                    this.draft_comments = draft_comments;
+
+                    this.editor.update(cx, |editor, cx| {
+                        editor.rhs_editor().update(cx, |editor, cx| {
+                            for comment in comments {
+                                let Some(line) = comment.line() else {
+                                    continue;
+                                };
+                                if editor.add_diff_review_comment_for_path_line(
+                                    &comment.path,
+                                    line,
+                                    comment.display_text(),
+                                    window,
+                                    cx,
+                                ) {
+                                    loaded_count += 1;
+                                }
+                            }
+
+                            for draft in &this.draft_comments {
+                                editor.add_diff_review_comment_for_path_line(
+                                    &draft.path,
+                                    draft.line,
+                                    draft.body.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        });
+                    });
+                    cx.notify();
+                    loaded_count
+                })?;
+
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        struct LoadPrCommentsToast;
+
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<LoadPrCommentsToast>(),
+                                format!("Loaded PR #{pr_number} body and {loaded_count} comments"),
+                            ),
+                            cx,
+                        );
+                    });
+                }
+
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(self.workspace.clone(), window, cx);
+    }
+
+    fn comment_on_pr(&mut self, _: &CommentOnPr, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pr_target) = self.pr_target(cx) else {
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    struct CommentOnPrToast;
+
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<CommentOnPrToast>(),
+                            "No local repository found for this review",
+                        ),
+                        cx,
+                    );
+                });
+            }
+            return;
+        };
+
+        let workspace = self.workspace.clone();
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                let workspace_handle = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    PrCommentModal::new(pr_target, workspace_handle, window, cx)
+                });
+            });
+        }
     }
 
     pub fn deploy_at(
@@ -386,6 +565,7 @@ impl ProjectDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let this_weak = cx.weak_entity();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -417,6 +597,7 @@ impl ProjectDiff {
                     DiffBase::Merge { .. } => {
                         editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff.clone(),
+                            project_diff: this_weak.clone(),
                         });
                     }
                 }
@@ -426,13 +607,120 @@ impl ProjectDiff {
         let editor_subscription = cx.subscribe_in(&editor, window, Self::handle_editor_event);
 
         let primary_editor = editor.read(cx).rhs_editor().clone();
-        let review_comment_subscription =
-            cx.subscribe(&primary_editor, |this, _editor, event: &EditorEvent, cx| {
-                if let EditorEvent::ReviewCommentsChanged { total_count } = event {
+        let review_comment_subscription = cx.subscribe(
+            &primary_editor,
+            |this, _editor, event: &EditorEvent, cx| match event {
+                EditorEvent::ReviewCommentsChanged { total_count } => {
                     this.review_comment_count = *total_count;
                     cx.notify();
                 }
-            });
+                EditorEvent::DiffReviewCommentSubmitted { path, line, body } => {
+                    let Some(pr_target) = this.pr_target(cx) else {
+                        return;
+                    };
+
+                    let workspace = this.workspace.clone();
+                    let workspace_id = workspace.read_with(cx, |w, _| w.database_id()).ok().flatten();
+                    let remote_url = pr_target.remote_url.clone().unwrap_or_default();
+                    let pr_number = this.pr_context.as_ref().map(|c| c.number).unwrap_or(0);
+                    let submit_mode = this.review_submit_mode;
+                    let db = persistence::ProjectDiffDb::global(cx);
+
+                    let comment = InlinePrCommentDraft {
+                        path: path.clone(),
+                        line: *line,
+                        body: body.clone(),
+                    };
+
+                    cx.spawn(async move |this, cx| {
+                        let result = cx
+                            .background_spawn({
+                                let pr_target = pr_target.clone();
+                                let comment = comment.clone();
+                                async move {
+                                    if submit_mode == PrReviewSubmitMode::PostNow {
+                                        post_inline_pr_comment(pr_target, comment).await
+                                    } else {
+                                        let position = github_diff_position_for_comment(
+                                            &pr_target.work_directory,
+                                            pr_number,
+                                            &comment,
+                                        )
+                                        .await?;
+
+                                        if let Some(workspace_id) = workspace_id {
+                                            db.save_draft_comment(
+                                                workspace_id,
+                                                remote_url,
+                                                pr_number,
+                                                comment.path,
+                                                comment.line,
+                                                position,
+                                                comment.body,
+                                            )
+                                            .await?;
+                                        }
+                                        anyhow::Ok(())
+                                    }
+                                }
+                            })
+                            .await;
+
+                        this.update(cx, |this, cx| {
+                            if result.is_ok()
+                                && submit_mode == PrReviewSubmitMode::AddToReview
+                            {
+                                if let Some(workspace_id) = workspace_id {
+                                    let db = persistence::ProjectDiffDb::global(cx);
+                                    let remote_url = this
+                                        .pr_target(cx)
+                                        .and_then(|t| t.remote_url)
+                                        .unwrap_or_default();
+                                    if let Ok(drafts) = db.get_draft_comments(
+                                        workspace_id,
+                                        remote_url,
+                                        pr_number,
+                                    ) {
+                                        this.draft_comments = drafts;
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+
+                        let Some(workspace) = workspace.upgrade() else {
+                            return anyhow::Ok(());
+                        };
+                        workspace.update(cx, |workspace, cx| {
+                            let message = match result {
+                                Ok(()) => {
+                                    if submit_mode == PrReviewSubmitMode::PostNow {
+                                        "Inline PR comment posted".to_string()
+                                    } else {
+                                        "Inline PR comment added to review".to_string()
+                                    }
+                                }
+                                Err(error) => {
+                                    format!("Failed to post inline PR comment: {error:#}")
+                                }
+                            };
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<PostedInlinePrCommentToast>(),
+                                    message,
+                                ),
+                                cx,
+                            );
+                        });
+
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+                }
+                _ => {}
+            },
+        );
 
         let branch_diff_subscription = cx.subscribe_in(
             &branch_diff,
@@ -491,6 +779,11 @@ impl ProjectDiff {
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            pr_context: None,
+            pr_context_load_started: false,
+            review_submit_mode: PrReviewSubmitMode::AddToReview,
+            reviewed_files: Default::default(),
+            draft_comments: Default::default(),
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -559,6 +852,78 @@ impl ProjectDiff {
         })
     }
 
+    pub fn toggle_file_reviewed(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(pr_target) = self.pr_target(cx) else {
+            return;
+        };
+        let remote_url = pr_target.remote_url.unwrap_or_default();
+        let pr_number = self.pr_context.as_ref().map(|c| c.number).unwrap_or(0);
+        let workspace_id = self.workspace.read_with(cx, |w, _| w.database_id()).ok().flatten();
+        let db = persistence::ProjectDiffDb::global(cx);
+
+        let reviewed = if self.reviewed_files.contains(&path) {
+            self.reviewed_files.remove(&path);
+            false
+        } else {
+            self.reviewed_files.insert(path.clone());
+            true
+        };
+
+        if let Some(workspace_id) = workspace_id {
+            cx.background_spawn(async move {
+                db.save_reviewed_file(workspace_id, remote_url, pr_number, path, reviewed)
+                    .await
+            })
+            .detach_and_log_err(cx);
+        }
+
+        cx.notify();
+    }
+
+    pub fn is_file_reviewed(&self, path: &str) -> bool {
+        self.reviewed_files.contains(path)
+    }
+
+    pub fn reviewed_file_count(&self) -> usize {
+        self.reviewed_files.len()
+    }
+
+    pub fn changed_file_paths(&self, cx: &App) -> Vec<String> {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let mut paths = Vec::new();
+        let mut seen = HashSet::default();
+        for excerpt in snapshot.excerpts() {
+            if let Some(path_info) = snapshot.path_for_buffer(excerpt.context.start.buffer_id) {
+                let path_string = path_info.path.as_std_path().to_string_lossy().to_string();
+                if seen.insert(path_string.clone()) {
+                    paths.push(path_string);
+                }
+            }
+        }
+        paths
+    }
+
+    pub fn toggle_review_submit_mode(&mut self, cx: &mut Context<Self>) {
+        self.review_submit_mode = match self.review_submit_mode {
+            PrReviewSubmitMode::AddToReview => PrReviewSubmitMode::PostNow,
+            PrReviewSubmitMode::PostNow => PrReviewSubmitMode::AddToReview,
+        };
+        cx.notify();
+    }
+
+    fn toggle_current_file_reviewed(
+        &mut self,
+        _: &ToggleCurrentFileReviewed,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_path) = self.active_path(cx) else {
+            return;
+        };
+        let path = project_path.path.as_std_path().to_string_lossy().to_string();
+        self.toggle_file_reviewed(path, cx);
+    }
+
     fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
@@ -590,6 +955,19 @@ impl ProjectDiff {
 
     pub fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
+    }
+
+    fn pr_target(&self, cx: &App) -> Option<PrTarget> {
+        let repo = self.branch_diff.read(cx).repo()?.read(cx);
+        let snapshot = repo.snapshot();
+        Some(PrTarget {
+            work_directory: snapshot.work_directory_abs_path.as_ref().to_path_buf(),
+            remote_url: repo.default_remote_url(),
+            branch_name: snapshot
+                .branch
+                .as_ref()
+                .map(|branch| branch.name().to_string()),
+        })
     }
 
     /// Returns the total count of review comments across all hunks/files.
@@ -920,6 +1298,17 @@ impl ProjectDiff {
             cx.notify();
         })?;
 
+        cx.update(|window, cx| {
+            this.update(cx, |this, cx| {
+                if matches!(this.diff_base(cx), DiffBase::Merge { .. })
+                    && !this.pr_context_load_started
+                {
+                    this.pr_context_load_started = true;
+                    this.load_pr_context(window, cx);
+                }
+            })
+        })??;
+
         Ok(())
     }
 
@@ -944,6 +1333,867 @@ impl ProjectDiff {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrContext {
+    number: u64,
+    title: String,
+    url: String,
+    body: String,
+    head_ref_name: String,
+    base_ref_name: String,
+}
+
+fn render_pr_body(pr_context: &PrContext, cx: &mut Context<ProjectDiff>) -> impl IntoElement {
+    let body = if pr_context.body.trim().is_empty() {
+        "_No PR body._"
+    } else {
+        pr_context.body.trim()
+    };
+
+    v_flex()
+        .w_full()
+        .max_h(rems(12.))
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(cx.theme().colors().border)
+        .bg(cx.theme().colors().editor_background)
+        .px_3()
+        .py_2()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Label::new(format!("#{} {}", pr_context.number, pr_context.title))
+                        .size(LabelSize::Small)
+                        .color(Color::Default),
+                )
+                .child(
+                    Label::new(format!(
+                        "{} <- {}  {}",
+                        pr_context.base_ref_name, pr_context.head_ref_name, pr_context.url
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                ),
+        )
+        .child(
+            div()
+                .max_h(rems(8.))
+                .overflow_hidden()
+                .child(Label::new(body).size(LabelSize::Small).color(Color::Muted)),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+struct InlinePrComment {
+    path: String,
+    line: Option<u32>,
+    original_line: Option<u32>,
+    position: Option<u32>,
+    original_position: Option<u32>,
+    diff_hunk: Option<String>,
+    side: Option<InlinePrCommentSide>,
+    body: String,
+    #[serde(default)]
+    html_url: String,
+    user: Option<PrAuthor>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+enum InlinePrCommentSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone)]
+struct InlinePrCommentDraft {
+    path: String,
+    line: u32,
+    body: String,
+}
+
+struct PostedInlinePrCommentToast;
+
+impl InlinePrComment {
+    fn line(&self) -> Option<u32> {
+        let diff_hunk = self.diff_hunk.as_deref();
+        match self.side {
+            Some(InlinePrCommentSide::Left) => {
+                let old_line = self.line.or(self.original_line)?;
+                diff_hunk
+                    .and_then(|diff_hunk| new_line_for_old_diff_line(diff_hunk, old_line))
+                    .or(Some(old_line))
+            }
+            _ => self.line.or_else(|| {
+                diff_hunk.and_then(|diff_hunk| {
+                    line_from_diff_position(
+                        diff_hunk,
+                        self.position.or(self.original_position).unwrap_or_default(),
+                    )
+                })
+            }),
+        }
+    }
+
+    fn display_text(&self) -> String {
+        let author = self
+            .user
+            .as_ref()
+            .map_or("unknown", |author| author.login.as_str());
+        if self.html_url.is_empty() {
+            format!("@{author}: {}", self.body.trim())
+        } else {
+            format!("@{author}: {}\n\n{}", self.body.trim(), self.html_url)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PrAuthor {
+    login: String,
+}
+
+#[derive(Clone)]
+struct PrTarget {
+    work_directory: PathBuf,
+    remote_url: Option<String>,
+    branch_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct ForgejoRemote {
+    host: String,
+    owner: String,
+    repo: String,
+}
+
+enum PrBackend {
+    Github,
+    Forgejo(ForgejoRemote),
+}
+
+impl PrBackend {
+    fn detect(target: &PrTarget) -> Result<Self> {
+        let Some(remote_url) = target.remote_url.as_deref() else {
+            return Ok(Self::Github);
+        };
+        let remote_url = remote_url
+            .parse::<RemoteUrl>()
+            .context("parsing git remote URL")?;
+        let host = remote_url.host_str().unwrap_or_default();
+        if host == "github.com" {
+            return Ok(Self::Github);
+        }
+
+        if host == "codeberg.org" || host.contains("forgejo") {
+            let mut path_segments = remote_url
+                .path_segments()
+                .context("reading git remote path segments")?;
+            let owner = path_segments
+                .next()
+                .context("missing owner in git remote URL")?
+                .to_string();
+            let repo = path_segments
+                .next()
+                .context("missing repo in git remote URL")?
+                .trim_end_matches(".git")
+                .to_string();
+            return Ok(Self::Forgejo(ForgejoRemote {
+                host: host.to_string(),
+                owner,
+                repo,
+            }));
+        }
+
+        Ok(Self::Github)
+    }
+}
+
+struct PrCommentModal {
+    editor: Entity<Editor>,
+    pr_target: PrTarget,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl PrCommentModal {
+    fn new(
+        pr_target: PrTarget,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Comment on this PR...", window, cx);
+            editor
+        });
+
+        Self {
+            editor,
+            pr_target,
+            workspace,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let body = self.editor.read(cx).text(cx).trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+
+        let pr_target = self.pr_target.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            cx.background_spawn(async move { post_pr_comment(pr_target, body).await })
+                .await?;
+
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    struct PostedPrCommentToast;
+
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<PostedPrCommentToast>(),
+                            "PR comment posted",
+                        ),
+                        cx,
+                    );
+                });
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
+
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for PrCommentModal {}
+impl ModalView for PrCommentModal {}
+
+impl Focusable for PrCommentModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for PrCommentModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("PrCommentModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::PullRequest).size(IconSize::XSmall))
+                    .child(Headline::new("Comment on PR").size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+async fn fetch_pr_context(target: PrTarget) -> Result<PrContext> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => fetch_github_pr_context(target.work_directory).await,
+        PrBackend::Forgejo(remote) => fetch_forgejo_pr_context(target, remote).await,
+    }
+}
+
+async fn fetch_github_pr_context(work_directory: PathBuf) -> Result<PrContext> {
+    let output = command::new_command("gh")
+        .args([
+            "pr",
+            "view",
+            "--json",
+            "number,title,body,headRefName,baseRefName,url",
+        ])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh pr view")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr view failed: {stderr}");
+    }
+
+    serde_json::from_slice(&output.stdout).context("parsing gh pr view output")
+}
+
+async fn fetch_inline_pr_comments(target: PrTarget) -> Result<Vec<InlinePrComment>> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => fetch_github_inline_pr_comments(target.work_directory).await,
+        PrBackend::Forgejo(remote) => fetch_forgejo_inline_pr_comments(target, remote).await,
+    }
+}
+
+async fn fetch_github_inline_pr_comments(work_directory: PathBuf) -> Result<Vec<InlinePrComment>> {
+    let pr_number_output = command::new_command("gh")
+        .args(["pr", "view", "--json", "number", "--jq", ".number"])
+        .current_dir(&work_directory)
+        .output()
+        .await
+        .context("running gh pr view")?;
+
+    if !pr_number_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pr_number_output.stderr);
+        anyhow::bail!("gh pr view failed: {stderr}");
+    }
+
+    let pr_number = String::from_utf8(pr_number_output.stdout)
+        .context("reading gh pr view output")?
+        .trim()
+        .to_string();
+    if pr_number.is_empty() {
+        anyhow::bail!("gh pr view did not return a PR number");
+    }
+
+    let endpoint = format!("repos/:owner/:repo/pulls/{pr_number}/comments");
+    let output = command::new_command("gh")
+        .args(["api", &endpoint])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh api for PR review comments")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api failed: {stderr}");
+    }
+
+    let comments: Vec<InlinePrComment> =
+        serde_json::from_slice(&output.stdout).context("parsing gh api review comments output")?;
+    Ok(comments
+        .into_iter()
+        .filter(|comment| comment.line().is_some())
+        .collect())
+}
+
+async fn post_pr_comment(target: PrTarget, body: String) -> Result<()> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => post_github_pr_comment(target.work_directory, body).await,
+        PrBackend::Forgejo(remote) => post_forgejo_pr_comment(target, remote, body).await,
+    }
+}
+
+async fn post_inline_pr_comment(target: PrTarget, comment: InlinePrCommentDraft) -> Result<()> {
+    match PrBackend::detect(&target)? {
+        PrBackend::Github => post_github_inline_pr_comment(target.work_directory, comment).await,
+        PrBackend::Forgejo(_) => {
+            anyhow::bail!("posting inline PR comments is only supported for GitHub")
+        }
+    }
+}
+
+async fn post_github_pr_comment(work_directory: PathBuf, body: String) -> Result<()> {
+    let output = command::new_command("gh")
+        .args(["pr", "comment", "--body", &body])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh pr comment")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr comment failed: {stderr}");
+    }
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubPrReviewTarget {
+    number: u64,
+    head_ref_oid: String,
+}
+
+async fn post_github_inline_pr_comment(
+    work_directory: PathBuf,
+    comment: InlinePrCommentDraft,
+) -> Result<()> {
+    let pr_output = command::new_command("gh")
+        .args(["pr", "view", "--json", "number,headRefOid"])
+        .current_dir(&work_directory)
+        .output()
+        .await
+        .context("running gh pr view")?;
+
+    if !pr_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pr_output.stderr);
+        anyhow::bail!("gh pr view failed: {stderr}");
+    }
+
+    let review_target: GithubPrReviewTarget =
+        serde_json::from_slice(&pr_output.stdout).context("parsing gh pr view output")?;
+    if review_target.head_ref_oid.is_empty() {
+        anyhow::bail!("gh pr view did not return a head commit");
+    }
+
+    post_github_inline_pr_comment_at_position(
+        &work_directory,
+        review_target.number,
+        &review_target.head_ref_oid,
+        &comment,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct GithubPrFile {
+    filename: String,
+    patch: Option<String>,
+}
+
+async fn post_github_inline_pr_comment_at_position(
+    work_directory: &PathBuf,
+    pr_number: u64,
+    commit_id: &str,
+    comment: &InlinePrCommentDraft,
+) -> Result<()> {
+    let position = github_diff_position_for_comment(work_directory, pr_number, comment).await?;
+    let endpoint = format!("repos/:owner/:repo/pulls/{pr_number}/comments");
+    let args = vec![
+        "api".to_string(),
+        endpoint,
+        "-f".to_string(),
+        format!("body={}", comment.body.as_str()),
+        "-f".to_string(),
+        format!("commit_id={commit_id}"),
+        "-f".to_string(),
+        format!("path={}", comment.path.as_str()),
+        "-F".to_string(),
+        format!("position={position}"),
+    ];
+    let output = command::new_command("gh")
+        .args(args)
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh api to post inline PR comment by position")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api failed: {stderr}");
+    }
+
+    Ok(())
+}
+
+async fn github_diff_position_for_comment(
+    work_directory: &PathBuf,
+    pr_number: u64,
+    comment: &InlinePrCommentDraft,
+) -> Result<u32> {
+    let endpoint = format!("repos/:owner/:repo/pulls/{pr_number}/files");
+    let output = command::new_command("gh")
+        .args(["api", &endpoint])
+        .current_dir(work_directory)
+        .output()
+        .await
+        .context("running gh api for PR files")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api failed: {stderr}");
+    }
+
+    let files: Vec<GithubPrFile> =
+        serde_json::from_slice(&output.stdout).context("parsing gh api PR files output")?;
+    let file = files
+        .into_iter()
+        .find(|file| file.filename == comment.path)
+        .with_context(|| format!("finding PR file `{}`", comment.path))?;
+    let patch = file
+        .patch
+        .with_context(|| format!("PR file `{}` has no patch", comment.path))?;
+
+    diff_position_for_line(&patch, comment.line).with_context(|| {
+        format!(
+            "finding diff position for {}:{}",
+            comment.path, comment.line
+        )
+    })
+}
+
+fn diff_position_for_line(patch: &str, line: u32) -> Option<u32> {
+    let mut old_line = None;
+    let mut new_line = None;
+    let mut position = 0;
+
+    for patch_line in patch.lines() {
+        position += 1;
+
+        if let Some((old_start, new_start)) = parse_diff_hunk_starts(patch_line) {
+            old_line = Some(old_start);
+            new_line = Some(new_start);
+            continue;
+        }
+
+        let current_old_line = old_line?;
+        let current_new_line = new_line?;
+
+        if patch_line.starts_with('-') {
+            if current_old_line == line {
+                return Some(position);
+            }
+            old_line = current_old_line.checked_add(1);
+        } else if patch_line.starts_with('+') {
+            if current_new_line == line {
+                return Some(position);
+            }
+            new_line = current_new_line.checked_add(1);
+        } else {
+            if current_old_line == line || current_new_line == line {
+                return Some(position);
+            }
+            old_line = current_old_line.checked_add(1);
+            new_line = current_new_line.checked_add(1);
+        }
+    }
+
+    None
+}
+
+fn parse_diff_hunk_starts(line: &str) -> Option<(u32, u32)> {
+    let header = line.strip_prefix("@@ -")?;
+    let (old_range, rest) = header.split_once(" +")?;
+    let (new_range, _) = rest.split_once(" @@")?;
+    Some((
+        parse_diff_range_start(old_range)?,
+        parse_diff_range_start(new_range)?,
+    ))
+}
+
+fn parse_diff_range_start(range: &str) -> Option<u32> {
+    range
+        .split_once(',')
+        .map_or(range, |(start, _)| start)
+        .parse()
+        .ok()
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoPullRequest {
+    number: Option<u64>,
+    title: Option<String>,
+    body: Option<String>,
+    html_url: Option<String>,
+    url: Option<String>,
+    base: Option<ForgejoPrBranch>,
+    head: Option<ForgejoPrBranch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoPrBranch {
+    #[serde(rename = "ref")]
+    ref_name: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoPullReview {
+    id: Option<u64>,
+}
+
+async fn fetch_forgejo_pr_context(target: PrTarget, remote: ForgejoRemote) -> Result<PrContext> {
+    let pr = fetch_forgejo_current_pr(&target, &remote).await?;
+    let number = pr.number.context("Forgejo PR is missing a number")?;
+
+    Ok(PrContext {
+        number,
+        title: pr.title.unwrap_or_else(|| "Untitled PR".to_string()),
+        url: pr.html_url.or(pr.url).unwrap_or_else(|| {
+            format!(
+                "https://{}/{}/{}/pulls/{}",
+                remote.host, remote.owner, remote.repo, number
+            )
+        }),
+        body: pr.body.unwrap_or_default(),
+        head_ref_name: pr
+            .head
+            .as_ref()
+            .and_then(|head| head.label.as_ref().or(head.ref_name.as_ref()))
+            .cloned()
+            .unwrap_or_default(),
+        base_ref_name: pr
+            .base
+            .as_ref()
+            .and_then(|base| base.label.as_ref().or(base.ref_name.as_ref()))
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+async fn fetch_forgejo_inline_pr_comments(
+    target: PrTarget,
+    remote: ForgejoRemote,
+) -> Result<Vec<InlinePrComment>> {
+    let pr = fetch_forgejo_current_pr(&target, &remote).await?;
+    let number = pr.number.context("Forgejo PR is missing a number")?;
+    let reviews = fetch_forgejo_reviews_raw(&remote, number).await?;
+    let mut comments = Vec::new();
+
+    for review in reviews {
+        let Some(review_id) = review.id else {
+            continue;
+        };
+        let path = format!(
+            "/repos/{}/{}/pulls/{}/reviews/{}/comments",
+            remote.owner, remote.repo, number, review_id
+        );
+        let output = forgejo_api_get(&remote, &path).await?;
+        let mut review_comments = serde_json::from_slice::<Vec<InlinePrComment>>(&output)
+            .context("parsing Forgejo review comments")?;
+        comments.append(&mut review_comments);
+    }
+
+    Ok(comments
+        .into_iter()
+        .filter(|comment| comment.line().is_some())
+        .collect())
+}
+
+async fn post_forgejo_pr_comment(
+    target: PrTarget,
+    remote: ForgejoRemote,
+    body: String,
+) -> Result<()> {
+    let fj_output = command::new_command("fj")
+        .args(["pr", "comment", &body])
+        .current_dir(&target.work_directory)
+        .output()
+        .await;
+
+    match fj_output {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::info!("fj pr comment failed, falling back to Forgejo API: {stderr}");
+        }
+        Err(error) => {
+            log::info!("failed to run fj pr comment, falling back to Forgejo API: {error:#}");
+        }
+    }
+
+    let pr = fetch_forgejo_current_pr(&target, &remote).await?;
+    let number = pr.number.context("Forgejo PR is missing a number")?;
+    let path = format!(
+        "/repos/{}/{}/issues/{}/comments",
+        remote.owner, remote.repo, number
+    );
+    forgejo_api_post_json(&remote, &path, serde_json::json!({ "body": body })).await?;
+    Ok(())
+}
+
+async fn fetch_forgejo_current_pr(
+    target: &PrTarget,
+    remote: &ForgejoRemote,
+) -> Result<ForgejoPullRequest> {
+    if let Ok(pr_number) = std::env::var("ZED_FORGEJO_PR") {
+        let pr_number = pr_number.trim();
+        if !pr_number.is_empty() {
+            let path = format!(
+                "/repos/{}/{}/pulls/{}",
+                remote.owner, remote.repo, pr_number
+            );
+            let output = forgejo_api_get(remote, &path).await?;
+            return serde_json::from_slice(&output).context("parsing Forgejo PR");
+        }
+    }
+
+    let path = format!(
+        "/repos/{}/{}/pulls?state=open&limit=50",
+        remote.owner, remote.repo
+    );
+    let output = forgejo_api_get(remote, &path).await?;
+    let prs: Vec<ForgejoPullRequest> =
+        serde_json::from_slice(&output).context("parsing Forgejo pull requests")?;
+
+    let Some(branch_name) = target.branch_name.as_deref() else {
+        return single_forgejo_pr(prs);
+    };
+
+    let matching_prs = prs
+        .into_iter()
+        .filter(|pr| {
+            pr.head.as_ref().is_some_and(|head| {
+                head.ref_name.as_deref() == Some(branch_name)
+                    || head.label.as_deref() == Some(branch_name)
+                    || head
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.ends_with(&format!(":{branch_name}")))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    single_forgejo_pr(matching_prs)
+        .with_context(|| format!("finding open Forgejo PR for current branch `{branch_name}`"))
+}
+
+fn single_forgejo_pr(mut prs: Vec<ForgejoPullRequest>) -> Result<ForgejoPullRequest> {
+    match prs.len() {
+        0 => anyhow::bail!("no matching open Forgejo PR found"),
+        1 => Ok(prs.remove(0)),
+        count => anyhow::bail!("found {count} matching Forgejo PRs; set ZED_FORGEJO_PR"),
+    }
+}
+
+async fn fetch_forgejo_reviews_raw(
+    remote: &ForgejoRemote,
+    pr_number: u64,
+) -> Result<Vec<ForgejoPullReview>> {
+    let path = format!(
+        "/repos/{}/{}/pulls/{}/reviews",
+        remote.owner, remote.repo, pr_number
+    );
+    let output = forgejo_api_get(remote, &path).await?;
+    serde_json::from_slice(&output).context("parsing Forgejo reviews")
+}
+
+async fn forgejo_api_get(remote: &ForgejoRemote, path: &str) -> Result<Vec<u8>> {
+    forgejo_api_request(remote, "GET", path, None).await
+}
+
+async fn forgejo_api_post_json(
+    remote: &ForgejoRemote,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<Vec<u8>> {
+    forgejo_api_request(remote, "POST", path, Some(body.to_string())).await
+}
+
+async fn forgejo_api_request(
+    remote: &ForgejoRemote,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<Vec<u8>> {
+    let url = format!("https://{}/api/v1{path}", remote.host);
+    let mut command = command::new_command("curl");
+    command.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--request",
+        method,
+        "--header",
+        "Accept: application/json",
+    ]);
+    if let Ok(token) = std::env::var("CODEBERG_TOKEN")
+        && !token.trim().is_empty()
+    {
+        command.args([
+            "--header",
+            &format!("Authorization: Bearer {}", token.trim()),
+        ]);
+    }
+    if let Some(body) = body {
+        command.args([
+            "--header",
+            "Content-Type: application/json",
+            "--data",
+            &body,
+        ]);
+    }
+    command.arg(url);
+
+    let output = command
+        .output()
+        .await
+        .context("running curl for Forgejo API")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Forgejo API request failed: {stderr}");
+    }
+    Ok(output.stdout)
+}
+
+fn line_from_diff_position(diff_hunk: &str, position: u32) -> Option<u32> {
+    if position == 0 {
+        return None;
+    }
+
+    let mut new_line = None;
+    let mut diff_position = 0;
+    for line in diff_hunk.lines() {
+        if let Some(start) = parse_new_line_start(line) {
+            new_line = Some(start);
+            diff_position = 0;
+            continue;
+        }
+
+        let current_new_line = new_line?;
+        diff_position += 1;
+        if diff_position == position {
+            return Some(current_new_line);
+        }
+
+        if !line.starts_with('-') {
+            new_line = current_new_line.checked_add(1);
+        }
+    }
+
+    None
+}
+
+fn new_line_for_old_diff_line(diff_hunk: &str, old_line: u32) -> Option<u32> {
+    let mut old_line_in_hunk = None;
+    let mut new_line_in_hunk = None;
+    for line in diff_hunk.lines() {
+        if let Some((old_start, new_start)) = parse_diff_hunk_starts(line) {
+            old_line_in_hunk = Some(old_start);
+            new_line_in_hunk = Some(new_start);
+            continue;
+        }
+
+        let current_old_line = old_line_in_hunk?;
+        let current_new_line = new_line_in_hunk?;
+
+        if line.starts_with('-') {
+            if current_old_line == old_line {
+                return Some(current_new_line);
+            }
+            old_line_in_hunk = current_old_line.checked_add(1);
+        } else if line.starts_with('+') {
+            new_line_in_hunk = current_new_line.checked_add(1);
+        } else {
+            if current_old_line == old_line {
+                return Some(current_new_line);
+            }
+            old_line_in_hunk = current_old_line.checked_add(1);
+            new_line_in_hunk = current_new_line.checked_add(1);
+        }
+    }
+
+    None
+}
+
+fn parse_new_line_start(line: &str) -> Option<u32> {
+    let plus_index = line.find('+')?;
+    let new_range = line.get(plus_index + 1..)?;
+    let end = new_range
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(new_range.len());
+    new_range.get(..end)?.parse().ok()
 }
 
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
@@ -1172,6 +2422,8 @@ impl Render for ProjectDiff {
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
             .when(is_branch_diff_view, |this| {
                 this.on_action(cx.listener(Self::review_diff))
+                    .on_action(cx.listener(Self::comment_on_pr))
+                    .on_action(cx.listener(Self::toggle_current_file_reviewed))
             })
             .bg(cx.theme().colors().editor_background)
             .flex()
@@ -1235,7 +2487,17 @@ impl Render for ProjectDiff {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                el.child(
+                    v_flex()
+                        .size_full()
+                        .overflow_hidden()
+                        .when_some(self.pr_context.as_ref(), |this, pr_context| {
+                            this.child(render_pr_body(pr_context, cx))
+                        })
+                        .child(self.editor.clone()),
+                )
+            })
     }
 }
 
@@ -1305,7 +2567,9 @@ impl SerializableItem for ProjectDiff {
 
 mod persistence {
 
+    use super::ReviewDraftComment;
     use anyhow::Context as _;
+    use collections;
     use db::{
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
         sqlez_macros::sql,
@@ -1318,7 +2582,8 @@ mod persistence {
     impl Domain for ProjectDiffDb {
         const NAME: &str = stringify!(ProjectDiffDb);
 
-        const MIGRATIONS: &[&str] = &[sql!(
+        const MIGRATIONS: &[&str] = &[
+            sql!(
                 CREATE TABLE project_diffs(
                     workspace_id INTEGER,
                     item_id INTEGER UNIQUE,
@@ -1329,7 +2594,46 @@ mod persistence {
                     FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
                     ON DELETE CASCADE
                 ) STRICT;
-        )];
+            ),
+            sql!(
+                CREATE TABLE pr_review_sessions(
+                    workspace_id INTEGER,
+                    remote_url TEXT,
+                    pr_number INTEGER,
+                    head_sha TEXT,
+                    last_load_time INTEGER,
+                    PRIMARY KEY(workspace_id, remote_url, pr_number)
+                ) STRICT;
+            ),
+            sql!(
+                CREATE TABLE pr_review_file_states(
+                    workspace_id INTEGER,
+                    remote_url TEXT,
+                    pr_number INTEGER,
+                    path TEXT,
+                    reviewed INTEGER,
+                    reviewed_at INTEGER,
+                    PRIMARY KEY(workspace_id, remote_url, pr_number, path)
+                ) STRICT;
+            ),
+            sql!(
+                CREATE TABLE pr_review_draft_comments(
+                    workspace_id INTEGER,
+                    remote_url TEXT,
+                    pr_number INTEGER,
+                    local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT,
+                    line INTEGER,
+                    position INTEGER,
+                    body TEXT,
+                    status TEXT,
+                    github_comment_id INTEGER,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    last_error TEXT
+                ) STRICT;
+            ),
+        ];
     }
 
     db::static_connection!(ProjectDiffDb, [WorkspaceDb]);
@@ -1361,10 +2665,11 @@ mod persistence {
             workspace_id: WorkspaceId,
         ) -> anyhow::Result<DiffBase> {
             let sql_stmt =
-                sql!(SELECT diff_base FROM project_diffs WHERE item_id =  ?AND workspace_id =  ?);
-            let diff_base_str = self.select_row_bound::<(ItemId, WorkspaceId), String>(sql_stmt)?(
-                (item_id, workspace_id),
-            )
+                sql!(SELECT diff_base FROM project_diffs WHERE item_id = ? AND workspace_id = ?);
+            let diff_base_str = self.select_row_bound::<(ItemId, WorkspaceId), String>(sql_stmt)?((
+                item_id,
+                workspace_id,
+            ))
             .context(::std::format!(
                 "Error in get_diff_base, select_row_bound failed to execute or parse for: {}",
                 sql_stmt
@@ -1373,6 +2678,133 @@ mod persistence {
                 return Ok(DiffBase::Head);
             };
             serde_json::from_str(&diff_base_str).context("deserializing diff base")
+        }
+
+        pub async fn save_reviewed_file(
+            &self,
+            workspace_id: WorkspaceId,
+            remote_url: String,
+            pr_number: u64,
+            path: String,
+            reviewed: bool,
+        ) -> anyhow::Result<()> {
+            self.write(move |connection| {
+                let sql_stmt = sql!(
+                    INSERT OR REPLACE INTO pr_review_file_states(workspace_id, remote_url, pr_number, path, reviewed, reviewed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                );
+                let reviewed_at = if reviewed {
+                    Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    )
+                } else {
+                    None
+                };
+                let mut query = connection
+                    .exec_bound::<(WorkspaceId, String, u64, String, bool, Option<u64>)>(sql_stmt)?;
+                query((workspace_id, remote_url, pr_number, path, reviewed, reviewed_at))
+                    .context("executing save_reviewed_file")
+            })
+            .await
+        }
+
+        pub fn get_reviewed_files(
+            &self,
+            workspace_id: WorkspaceId,
+            remote_url: String,
+            pr_number: u64,
+        ) -> anyhow::Result<collections::HashSet<String>> {
+            let sql_stmt = sql!(
+                SELECT path FROM pr_review_file_states
+                WHERE workspace_id = ? AND remote_url = ? AND pr_number = ? AND reviewed = 1
+            );
+            let paths = self.select_bound::<(WorkspaceId, String, u64), String>(sql_stmt)?((
+                workspace_id,
+                remote_url,
+                pr_number,
+            ))?;
+            Ok(paths.into_iter().collect())
+        }
+
+        pub async fn save_draft_comment(
+            &self,
+            workspace_id: WorkspaceId,
+            remote_url: String,
+            pr_number: u64,
+            path: String,
+            line: u32,
+            position: u32,
+            body: String,
+        ) -> anyhow::Result<()> {
+            self.write(move |connection| {
+                let sql_stmt = sql!(
+                    INSERT INTO pr_review_draft_comments(workspace_id, remote_url, pr_number, path, line, position, body, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let status = "draft".to_string();
+                let mut query = connection
+                    .exec_bound::<(WorkspaceId, String, u64, String, u32, u32, String, String, u64, u64)>(
+                        sql_stmt,
+                    )?;
+                query((
+                    workspace_id,
+                    remote_url,
+                    pr_number,
+                    path,
+                    line,
+                    position,
+                    body,
+                    status,
+                    now,
+                    now,
+                ))?;
+                Ok(())
+            })
+            .await
+        }
+
+        #[allow(dead_code)]
+        pub async fn delete_draft_comment(&self, local_id: u64) -> anyhow::Result<()> {
+            self.write(move |connection| {
+                let sql_stmt = sql!(DELETE FROM pr_review_draft_comments WHERE local_id = ?);
+                let mut query = connection.exec_bound::<u64>(sql_stmt)?;
+                query(local_id).context("executing delete_draft_comment")
+            })
+            .await
+        }
+
+        pub fn get_draft_comments(
+            &self,
+            workspace_id: WorkspaceId,
+            remote_url: String,
+            pr_number: u64,
+        ) -> anyhow::Result<Vec<ReviewDraftComment>> {
+            let sql_stmt = sql!(
+                SELECT local_id, path, line, position, body, status FROM pr_review_draft_comments
+                WHERE workspace_id = ? AND remote_url = ? AND pr_number = ?
+            );
+            let rows = self
+                .select_bound::<(WorkspaceId, String, u64), (u64, String, u32, u32, String, String)>(
+                    sql_stmt,
+                )?((workspace_id, remote_url, pr_number))?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, path, line, position, body, status)| ReviewDraftComment {
+                    id,
+                    path,
+                    line,
+                    position,
+                    body,
+                    status,
+                })
+                .collect())
         }
     }
 }
@@ -1441,7 +2873,10 @@ impl ToolbarItemView for ProjectDiffToolbar {
     ) -> ToolbarItemLocation {
         self.project_diff = active_pane_item
             .and_then(|item| item.act_as::<ProjectDiff>(cx))
-            .filter(|item| item.read(cx).diff_base(cx) == &DiffBase::Head)
+            .filter(|item| {
+                let base = item.read(cx).diff_base(cx);
+                matches!(base, DiffBase::Head | DiffBase::Merge { .. })
+            })
             .map(|entity| entity.downgrade());
         if self.project_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
@@ -1476,6 +2911,8 @@ impl Render for ProjectDiffToolbar {
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
         let review_count = project_diff.read(cx).total_review_comment_count();
+        let is_pr_review_mode = matches!(project_diff.read(cx).diff_base(cx), DiffBase::Merge { .. });
+        let submit_mode = project_diff.read(cx).review_submit_mode;
 
         h_group_xl()
             .my_neg_1()
@@ -1483,59 +2920,82 @@ impl Render for ProjectDiffToolbar {
             .items_center()
             .flex_wrap()
             .justify_between()
-            .child(
-                h_group_sm()
-                    .when(button_states.selection, |el| {
-                        el.child(
-                            Button::new("stage", "Toggle Staged")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Toggle Staged",
-                                    &ToggleStaged,
-                                    &focus_handle,
-                                ))
-                                .disabled(!button_states.stage && !button_states.unstage)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&ToggleStaged, window, cx)
-                                })),
-                        )
-                    })
-                    .when(!button_states.selection, |el| {
-                        el.child(
-                            Button::new("stage", "Stage")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and go to next hunk",
-                                    &StageAndNext,
-                                    &focus_handle,
-                                ))
-                                .disabled(
-                                    !button_states.prev_next
-                                        && !button_states.stage_all
-                                        && !button_states.unstage_all,
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&StageAndNext, window, cx)
-                                })),
-                        )
+            .when(is_pr_review_mode, |el| {
+                el.child(
+                    h_group_sm()
+                        .child(Label::new("Submit Mode:"))
                         .child(
-                            Button::new("unstage", "Unstage")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Unstage and go to next hunk",
-                                    &UnstageAndNext,
-                                    &focus_handle,
-                                ))
-                                .disabled(
-                                    !button_states.prev_next
-                                        && !button_states.stage_all
-                                        && !button_states.unstage_all,
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&UnstageAndNext, window, cx)
-                                })),
-                        )
-                    }),
-            )
-            // n.b. the only reason these arrows are here is because we don't
-            // support "undo" for staging so we need a way to go back.
+                            Button::new(
+                                "submit-mode-toggle",
+                                match submit_mode {
+                                    PrReviewSubmitMode::AddToReview => "Add to Review",
+                                    PrReviewSubmitMode::PostNow => "Post Now",
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                if let Some(project_diff) = this.project_diff(cx) {
+                                    project_diff.update(cx, |project_diff, cx| {
+                                        project_diff.toggle_review_submit_mode(cx);
+                                    });
+                                }
+                            })),
+                        ),
+                )
+                .child(vertical_divider())
+            })
+            .when(!is_pr_review_mode, |el| {
+                el.child(
+                    h_group_sm()
+                        .when(button_states.selection, |el| {
+                            el.child(
+                                Button::new("stage", "Toggle Staged")
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        "Toggle Staged",
+                                        &ToggleStaged,
+                                        &focus_handle,
+                                    ))
+                                    .disabled(!button_states.stage && !button_states.unstage)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dispatch_action(&ToggleStaged, window, cx)
+                                    })),
+                            )
+                        })
+                        .when(!button_states.selection, |el| {
+                            el.child(
+                                Button::new("stage", "Stage")
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        "Stage and go to next hunk",
+                                        &StageAndNext,
+                                        &focus_handle,
+                                    ))
+                                    .disabled(
+                                        !button_states.prev_next
+                                            && !button_states.stage_all
+                                            && !button_states.unstage_all,
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dispatch_action(&StageAndNext, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("unstage", "Unstage")
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        "Unstage and go to next hunk",
+                                        &UnstageAndNext,
+                                        &focus_handle,
+                                    ))
+                                    .disabled(
+                                        !button_states.prev_next
+                                            && !button_states.stage_all
+                                            && !button_states.unstage_all,
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dispatch_action(&UnstageAndNext, window, cx)
+                                    })),
+                            )
+                        }),
+                )
+            })
             .child(
                 h_group_sm()
                     .child(
@@ -1565,60 +3025,59 @@ impl Render for ProjectDiffToolbar {
                             })),
                     ),
             )
-            .child(vertical_divider())
-            .child(
-                h_group_sm()
-                    .when(
-                        button_states.unstage_all && !button_states.stage_all,
-                        |el| {
-                            el.child(
-                                Button::new("unstage-all", "Unstage All")
+            .when(!is_pr_review_mode, |el| {
+                el.child(vertical_divider())
+                    .child(
+                        h_group_sm()
+                            .when(
+                                button_states.unstage_all && !button_states.stage_all,
+                                |el| {
+                                    el.child(
+                                        Button::new("unstage-all", "Unstage All")
+                                            .tooltip(Tooltip::for_action_title_in(
+                                                "Unstage all changes",
+                                                &UnstageAll,
+                                                &focus_handle,
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.unstage_all(window, cx)
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(
+                                !button_states.unstage_all || button_states.stage_all,
+                                |el| {
+                                    el.child(
+                                        div().child(
+                                            Button::new("stage-all", "Stage All")
+                                                .disabled(!button_states.stage_all)
+                                                .tooltip(Tooltip::for_action_title_in(
+                                                    "Stage all changes",
+                                                    &StageAll,
+                                                    &focus_handle,
+                                                ))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.stage_all(window, cx)
+                                                })),
+                                        ),
+                                    )
+                                },
+                            )
+                            .child(
+                                Button::new("commit", "Commit")
                                     .tooltip(Tooltip::for_action_title_in(
-                                        "Unstage all changes",
-                                        &UnstageAll,
+                                        "Commit",
+                                        &Commit,
                                         &focus_handle,
                                     ))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.unstage_all(window, cx)
+                                        this.dispatch_action(&Commit, window, cx);
                                     })),
-                            )
-                        },
+                            ),
                     )
-                    .when(
-                        !button_states.unstage_all || button_states.stage_all,
-                        |el| {
-                            el.child(
-                                // todo make it so that changing to say "Unstaged"
-                                // doesn't change the position.
-                                div().child(
-                                    Button::new("stage-all", "Stage All")
-                                        .disabled(!button_states.stage_all)
-                                        .tooltip(Tooltip::for_action_title_in(
-                                            "Stage all changes",
-                                            &StageAll,
-                                            &focus_handle,
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.stage_all(window, cx)
-                                        })),
-                                ),
-                            )
-                        },
-                    )
-                    .child(
-                        Button::new("commit", "Commit")
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Commit",
-                                &Commit,
-                                &focus_handle,
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&Commit, window, cx);
-                            })),
-                    ),
-            )
-            // "Send Review to Agent" button (only shown when there are review comments)
-            .when(review_count > 0, |el| {
+            })
+            .when(!is_pr_review_mode && review_count > 0, |el| {
                 el.child(vertical_divider()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
                         cx.listener(|this, _, window, cx| {
@@ -1706,7 +3165,6 @@ impl Render for BranchDiffToolbar {
             return div();
         };
         let focus_handle = project_diff.focus_handle(cx);
-        let review_count = project_diff.read(cx).total_review_comment_count();
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let diff_base = project_diff.read(cx).diff_base(cx).clone();
         let DiffBase::Merge { base_ref } = diff_base else {
@@ -1719,9 +3177,11 @@ impl Render for BranchDiffToolbar {
         let project_diff_for_picker = project_diff.downgrade();
 
         let is_multibuffer_empty = project_diff.read(cx).multibuffer.read(cx).is_empty();
-        let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
-        let show_review_button = !is_multibuffer_empty && is_ai_enabled;
+        let reviewed_count = project_diff.read(cx).reviewed_file_count();
+        let changed_paths = project_diff.read(cx).changed_file_paths(cx);
+        let total_files = changed_paths.len();
+        let has_pr_context = project_diff.read(cx).pr_context.is_some();
 
         h_group_xl()
             .my_neg_1()
@@ -1775,37 +3235,57 @@ impl Render for BranchDiffToolbar {
                     deletions as usize,
                 ))
             })
-            .when(show_review_button, |this| {
+            .when(has_pr_context && total_files > 0, |this| {
+                let project_diff_weak = self.project_diff.clone();
+                this.child(Divider::vertical())
+                    .child(
+                        Label::new(format!("{reviewed_count}/{total_files} reviewed"))
+                            .size(LabelSize::Small)
+                            .color(if reviewed_count == total_files {
+                                Color::Success
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .child(
+                        IconButton::new("toggle-file-reviewed", IconName::Check)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::text("Toggle current file reviewed"))
+                            .on_click(cx.listener(move |_this, _, window, cx| {
+                                if let Some(project_diff) = project_diff_weak.as_ref().and_then(|w| w.upgrade()) {
+                                    project_diff.update(cx, |project_diff, cx| {
+                                        project_diff.toggle_current_file_reviewed(
+                                            &ToggleCurrentFileReviewed,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            })),
+                    )
+            })
+            .when(!is_multibuffer_empty, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
-                    Button::new("review-diff", "Review Diff")
+                    Button::new("comment-on-pr", "Comment on PR")
                         .start_icon(
-                            Icon::new(IconName::ZedAssistant)
+                            Icon::new(IconName::PullRequest)
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
-                        .key_binding(KeyBinding::for_action_in(&ReviewDiff, &focus_handle, cx))
+                        .key_binding(KeyBinding::for_action_in(&CommentOnPr, &focus_handle, cx))
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(
-                                "Review Diff",
-                                Some(&ReviewDiff),
-                                "Send this diff for your last agent to review.",
+                                "Comment on PR",
+                                Some(&CommentOnPr),
+                                "Post a general comment to this branch's pull request.",
                                 &focus_handle,
                                 cx,
                             )
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&ReviewDiff, window, cx);
+                            this.dispatch_action(&CommentOnPr, window, cx);
                         })),
-                )
-            })
-            .when(review_count > 0, |this| {
-                this.child(vertical_divider()).child(
-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
-                        }),
-                    ),
                 )
             })
     }
@@ -1813,6 +3293,7 @@ impl Render for BranchDiffToolbar {
 
 struct BranchDiffAddon {
     branch_diff: Entity<branch_diff::BranchDiff>,
+    project_diff: WeakEntity<ProjectDiff>,
 }
 
 impl Addon for BranchDiffAddon {
@@ -1828,6 +3309,49 @@ impl Addon for BranchDiffAddon {
         self.branch_diff
             .read(cx)
             .status_for_buffer_id(buffer_id, cx)
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        _excerpt_info: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let project_diff = self.project_diff.upgrade()?;
+        let project_diff_read = project_diff.read(cx);
+        if project_diff_read.pr_context.is_none() {
+            return None;
+        }
+
+        let file = buffer.file()?;
+        let path = file.path().as_std_path().to_string_lossy().to_string();
+        let is_reviewed = project_diff_read.is_file_reviewed(&path);
+        let buffer_id = buffer.remote_id();
+
+        let project_diff_weak = self.project_diff.clone();
+        Some(
+            Checkbox::new("reviewed-file", ToggleState::from(is_reviewed))
+                .fill()
+                .elevation(ElevationIndex::Surface)
+                .on_click(move |_state, _window, cx| {
+                    if let Some(project_diff) = project_diff_weak.upgrade() {
+                        project_diff.update(cx, |project_diff, cx| {
+                            let will_be_reviewed =
+                                !project_diff.is_file_reviewed(&path);
+                            project_diff.toggle_file_reviewed(path.clone(), cx);
+                            if will_be_reviewed {
+                                project_diff.editor.update(cx, |editor, cx| {
+                                    editor.rhs_editor().update(cx, |editor, cx| {
+                                        editor.fold_buffer(buffer_id, cx);
+                                    });
+                                });
+                            }
+                        });
+                    }
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -2907,5 +4431,40 @@ mod tests {
         let paths_b = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
         assert_eq!(paths_b.len(), 1);
         assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    #[test]
+    fn test_diff_position_for_line() {
+        let patch = "\
+@@ -1,3 +1,4 @@
+ line1
+-line2
++line2 mod
+ line3
+@@ -10,3 +11,3 @@
+ line10
+-line11
++line11 mod
+ line12
+";
+
+        // Hunk 1 header is at position 1
+        // line1: old=1, new=1, pos=2
+        // -line2: old=2, pos=3
+        // +line2 mod: new=2, pos=4
+        // line3: old=3, new=3, pos=5
+        // Hunk 2 header: pos=6
+        // line10: old=10, new=10, pos=7
+        // -line11: old=11, pos=8
+        // +line11 mod: new=11, pos=9
+        // line12: old=12, new=12, pos=10
+
+        assert_eq!(diff_position_for_line(patch, 1), Some(2));
+        assert_eq!(diff_position_for_line(patch, 2), Some(3));
+        assert_eq!(diff_position_for_line(patch, 3), Some(5));
+        assert_eq!(diff_position_for_line(patch, 10), Some(7));
+        assert_eq!(diff_position_for_line(patch, 11), Some(7)); // new line 11 is at pos 7
+        assert_eq!(diff_position_for_line(patch, 12), Some(9)); // new line 12 is at pos 9
+        assert_eq!(diff_position_for_line(patch, 13), Some(10)); // new line 13 is at pos 10
     }
 }
