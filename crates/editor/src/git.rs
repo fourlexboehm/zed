@@ -494,6 +494,79 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn add_diff_review_comment_for_path_line(
+        &mut self,
+        file_path: &str,
+        line: u32,
+        comment: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some((hunk_key, anchor_range)) =
+            Self::diff_review_location_for_path_line(&buffer_snapshot, file_path, line)
+        else {
+            return false;
+        };
+
+        if !self
+            .diff_review_overlays
+            .iter()
+            .any(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &buffer_snapshot))
+        {
+            let editor_snapshot = self.snapshot(window, cx);
+            let display_row = hunk_key
+                .hunk_start_anchor
+                .to_display_point(&editor_snapshot.display_snapshot)
+                .row();
+            self.show_diff_review_overlay(display_row..display_row, window, cx);
+        }
+
+        self.add_review_comment(hunk_key.clone(), comment, anchor_range, cx);
+        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        true
+    }
+
+    fn diff_review_location_for_path_line(
+        snapshot: &MultiBufferSnapshot,
+        file_path: &str,
+        line: u32,
+    ) -> Option<(DiffHunkKey, Range<Anchor>)> {
+        let buffer_row = line.saturating_sub(1);
+        for excerpt in snapshot.excerpts() {
+            let buffer_id = excerpt.context.start.buffer_id;
+            let path = snapshot.path_for_buffer(buffer_id)?;
+            if path.path.as_unix_str() != file_path {
+                continue;
+            }
+
+            let buffer_snapshot = snapshot.buffer_for_id(buffer_id)?;
+            let max_row = buffer_snapshot.max_point().row;
+            let row = buffer_row.min(max_row);
+            let line_start = Point::new(row, 0);
+            let line_end = Point::new(row, buffer_snapshot.line_len(row));
+            let line_start_anchor = buffer_snapshot.anchor_before(line_start);
+            let line_end_anchor = buffer_snapshot.anchor_after(line_end);
+
+            if !excerpt.contains(&line_start_anchor, buffer_snapshot) {
+                continue;
+            }
+
+            let hunk_start_anchor = snapshot.anchor_in_buffer(line_start_anchor)?;
+            let range = snapshot.anchor_in_buffer(line_start_anchor)?
+                ..snapshot.anchor_in_buffer(line_end_anchor)?;
+            return Some((
+                DiffHunkKey {
+                    file_path: path.path.clone(),
+                    hunk_start_anchor,
+                },
+                range,
+            ));
+        }
+
+        None
+    }
+
     /// Stores the diff review comment locally.
     /// Comments are stored per-hunk and can later be batch-submitted to the Agent panel.
     pub fn submit_diff_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -505,6 +578,33 @@ impl Editor {
         let Some(overlay_index) = overlay_index else {
             return;
         };
+
+        self.submit_diff_review_comment_at_overlay_index(overlay_index, window, cx);
+    }
+
+    fn submit_diff_review_comment_for_prompt(
+        &mut self,
+        prompt_editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let overlay_index = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| overlay.prompt_editor.entity_id() == prompt_editor.entity_id());
+        let Some(overlay_index) = overlay_index else {
+            return;
+        };
+
+        self.submit_diff_review_comment_at_overlay_index(overlay_index, window, cx);
+    }
+
+    fn submit_diff_review_comment_at_overlay_index(
+        &mut self,
+        overlay_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let overlay = &self.diff_review_overlays[overlay_index];
 
         let comment_text = overlay.prompt_editor.read(cx).text(cx).trim().to_string();
@@ -514,8 +614,20 @@ impl Editor {
 
         let anchor_range = overlay.anchor_range.clone();
         let hunk_key = overlay.hunk_key.clone();
+        let path = hunk_key.file_path.as_unix_str().to_string();
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let start_point = anchor_range.start.to_point(&snapshot);
+        let line = snapshot
+            .point_to_buffer_point(start_point)
+            .map_or(start_point.row, |(_, point)| point.row)
+            + 1;
 
-        self.add_review_comment(hunk_key.clone(), comment_text, anchor_range, cx);
+        self.add_review_comment(hunk_key.clone(), comment_text.clone(), anchor_range, cx);
+        cx.emit(EditorEvent::DiffReviewCommentSubmitted {
+            path,
+            line,
+            body: comment_text,
+        });
 
         // Clear the prompt editor but keep the overlay open
         if let Some(overlay) = self.diff_review_overlays.get(overlay_index) {
@@ -2159,6 +2271,8 @@ impl Editor {
         let comment_count = comments.len();
         let avatar_size = px(20.);
         let action_icon_size = IconSize::XSmall;
+        let editor_handle_for_add = editor_handle.clone();
+        let prompt_editor_for_add = prompt_editor.clone();
 
         v_flex()
             .w_full()
@@ -2239,11 +2353,16 @@ impl Editor {
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Add comment"))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(crate::actions::SubmitDiffReviewComment),
-                                            cx,
-                                        );
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(editor) = editor_handle_for_add.upgrade() {
+                                            editor.update(cx, |editor, cx| {
+                                                editor.submit_diff_review_comment_for_prompt(
+                                                    &prompt_editor_for_add,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
                                     }),
                             ),
                     ),

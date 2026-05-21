@@ -11427,6 +11427,11 @@ pub enum EditorEvent {
         /// The new total count of review comments.
         total_count: usize,
     },
+    DiffReviewCommentSubmitted {
+        path: String,
+        line: u32,
+        body: String,
+    },
     InputIgnored {
         text: Arc<str>,
     },
